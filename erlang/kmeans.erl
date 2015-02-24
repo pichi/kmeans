@@ -1,64 +1,48 @@
 -module(kmeans).
 -export([run/3]).
 
+-compile(inline).
+
 run(Xs, N, Iters) ->
-	InitCentroids = lists:sublist(Xs, N),
-	step(Iters, Xs, InitCentroids).
+    Parent = self(),
+    Worker = fun() ->
+                     InitCentroids = lists:sublist(Xs, N),
+                     Step = fun(_, Centroids) ->
+                                    [average(X) || X <- clusters(Xs, Centroids)]
+                            end,
+                     Result = lists:foldl(Step, InitCentroids, lists:seq(1, Iters)),
+                     Parent ! {self(), Result}
+             end,
+    Pid = spawn_link(Worker), % spawn worker for abusing process dictionary
+    receive {Pid, Result} -> Result end.
 
-step(N, Xs, Centroids) ->
-	NewCentroids = lists:map(fun(X) -> average(X) end, clusters(Xs, Centroids)),
-	case N of
-		0 -> NewCentroids;
-		_ -> step((N-1), Xs, NewCentroids)
-	end.
+dist({X1, Y1}, {X2, Y2})
+  when is_float(X1), is_float(X2), is_float(Y1), is_float(Y2)->
+    DX = X1-X2,
+    DY = Y1-Y2,
+    DX*DX+DY*DY.
 
-divide({Px,Py}, K) ->
-	{Px/K, Py/K}.
+average(Q) ->
+    average(length(Q), Q, 0.0, 0.0).
 
-add({Px1, Py1}, {Px2, Py2}) ->
-	{(Px1+Px2), (Py1+Py2)}.
+average(L, [], X, Y) -> {X/L, Y/L};
+average(L, [{X, Y}|T], XAcc, YAcc)
+  when is_float(X), is_float(Y) ->
+    average(L, T, XAcc+X, YAcc+Y).
 
-sub({Px1, Py1}, {Px2, Py2}) ->
-	{(Px1-Px2), (Py1-Py2)}.
+closest(P, Centroids) ->
+    element(2, lists:min([{dist(P, C), C} || C <- Centroids])).
 
-sq(X) -> 
-	X*X.
-
-modulus({Px, Py}) ->
-	math:sqrt((sq(Px) + sq(Py))).
-
-dist(P1, P2) ->
-	modulus(sub(P1,P2)).
-
-average([]) -> 0;
-average(Q) -> divide(sum(Q),length(Q)).
-
-sum([]) -> 0;
-sum([H]) -> H;
-sum([H | T]) -> add(H,sum(T)).
-
-closest(P, [H | T]) ->
-	First = {dist(P, H), H},
-	closest(P, T, First).
-closest(_, [], {_, Found}) -> Found;
-closest(P, [H | T], {ActualWeight, ActualPoint}) ->
-	NewWeight = dist(H, P),
-	if
-		NewWeight > ActualWeight -> closest(P, T, {ActualWeight, ActualPoint});
-		true -> closest(P, T, {NewWeight, H})
-	end.
-	
 clusters(Xs, Centroids) ->
-	groupBy(Xs, fun(X) -> closest(X, Centroids) end).
+    groupBy(Xs, fun(X) -> closest(X, Centroids) end).
 
 groupBy(L, Fn) ->
-	TableId = groupBy(L, Fn, dict:new()),
-	values(dict:to_list(TableId)).
+    [add(Fn(X), X) || X <- L],
+    [ C || {_, C} <- erase() ].
 
-values([]) -> [];
-values([{_, V} | T]) ->
-	[V | values(T)].
-
-groupBy([], _, TId) -> TId;
-groupBy([H | T], Fn, TId) ->
-	groupBy(T, Fn, dict:append(erlang:phash2(Fn(H)), H, TId)).
+add(K, V) ->
+    T = case get(K) of
+            L when is_list(L) -> L;
+            undefined -> []
+        end,
+    put(K, [V | T]).

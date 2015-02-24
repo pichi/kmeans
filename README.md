@@ -29,6 +29,8 @@ How to run
     2> c(kmeans).
     3> main:run().
 
+Use `c(kmeans, native).` for native compiled version.
+
 **Factor**:
 
     USE: kmeans.benchmark
