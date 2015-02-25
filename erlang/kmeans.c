@@ -3,18 +3,88 @@
 #include <string.h>
 #include <math.h>
 
-typedef struct avg_state {
-    unsigned n;
-    double x[];
-} avg_state;
-
-static inline size_t avg_state_size(const unsigned size) {
-    return sizeof(avg_state) + size * sizeof(double);
+static inline double
+distance(const double *a, const double *b, const unsigned size) {
+    double distance = 0.0;
+    for (unsigned i = 0; i<size; i++) {
+        const double d = a[i]-b[i];
+        distance += d*d;
+    };
+    return distance;
 }
 
-static inline avg_state *
-get_state(avg_state *base, const unsigned size, const unsigned index) {
-    return (avg_state *)((char *)base + index*avg_state_size(size));
+static int
+points_bin(ErlNifEnv *env, ERL_NIF_TERM term, const unsigned size, const double **data, unsigned *length){
+    ErlNifBinary bin;
+    const unsigned point_size = size*sizeof(double);
+    if (!(
+                enif_inspect_binary(env, term, &bin)
+                && bin.size > 0
+                && (bin.size % point_size) == 0
+         )) return 0;
+    *data = (const double *)bin.data;
+    *length = bin.size / point_size;
+    return 1;
+}
+
+static ERL_NIF_TERM step(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]){
+    unsigned s = 0;
+    const double *data, *centroids;
+    double *new;
+    unsigned l, c;
+    ERL_NIF_TERM result;
+
+    if (!(
+                enif_get_uint(env, argv[0], &s) &&
+                s > 0 &&
+                points_bin(env, argv[1], s, &data, &l) &&
+                l > 0 &&
+                points_bin(env, argv[2], s, &centroids, &c) &&
+                c > 0 && c < l &&
+                (new = (double *)enif_make_new_binary(env, c*s*sizeof(double), &result))
+         )) return enif_make_badarg(env);
+
+    // clear new centroids
+    memset(new, 0, c*s*sizeof(double));
+
+    // declarations
+    const unsigned size = s, count = c, len = l;
+    unsigned *counts = (unsigned *)enif_alloc(count * sizeof(unsigned));
+    if (!counts) return enif_make_badarg(env);
+    memset(counts, 0, count * sizeof(unsigned));
+
+    // loop over points (xs) and set states
+    double sum_d = 0.0;
+    for (unsigned i=0; i<len; i++) {
+        // find minimum
+        unsigned min_i = 0;
+        const double *point = data + i*size;
+        double min_d = distance(point, centroids, size);
+        for (unsigned j = 1; j<count; j++) {
+            const double d = distance(point, centroids + j*size, size);
+            if (d<min_d) { min_d = d; min_i = j; };
+        }
+
+        // update state
+        sum_d += min_d;
+        counts[min_i]++;
+        for (unsigned j=0; j<size; j++) new[min_i*size+j] += point[j];
+    }
+
+    // prepare new centroids (average)
+    for (unsigned i=0; i<count; i++) {
+        if (counts[i]) {
+            const double n = counts[i];
+            for (unsigned j=0; j<size; j++)
+                new[i*size+j] /= n;
+        }
+    }
+
+    // add distance info
+    result = enif_make_tuple2(env, result, enif_make_double(env, sum_d));
+
+    enif_free(counts);
+    return result;
 }
 
 static inline int
@@ -30,14 +100,30 @@ get_point(ErlNifEnv* env, ERL_NIF_TERM term, const unsigned size, double *data) 
     return 1;
 }
 
-static inline double
-distance(const double *a, const double *b, const unsigned size) {
-    double distance = 0.0;
-    for (unsigned i = 0; i<size; i++) {
-        const double d = a[i]-b[i];
-        distance += d*d;
-    };
-    return distance;
+static ERL_NIF_TERM points2bin(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]){
+    ERL_NIF_TERM list = argv[0];
+    unsigned len = 0;
+    int s = 0;
+    const ERL_NIF_TERM *array;
+    ERL_NIF_TERM head, result;
+    double *data;
+
+    if (!(
+                enif_get_list_length(env, list, &len) &&
+                len > 0 &&
+                enif_get_list_cell(env, list, &head, &result) &&
+                enif_get_tuple(env, head, &s, &array) &&
+                s > 0 &&
+                (data = (double *)enif_make_new_binary(env, len*s*sizeof(double), &result))
+         )) return enif_make_badarg(env);
+
+    const unsigned size = s;
+    for (unsigned i=0; enif_get_list_cell(env, list, &head, &list); i++) {
+        if (!get_point(env, head, size, data + i*size))
+            return enif_make_badarg(env);
+    }
+
+    return result;
 }
 
 static inline ERL_NIF_TERM
@@ -48,86 +134,31 @@ make_point(ErlNifEnv* env, const double *d, const unsigned size) {
     return enif_make_tuple_from_array(env, array, size);
 }
 
-static ERL_NIF_TERM step(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]){
-    ERL_NIF_TERM xs = argv[0], centroids = argv[1];
-    unsigned c_count = 0;
-    int c_arity = 0;
-    const ERL_NIF_TERM *array;
-    ERL_NIF_TERM head, tail;
+static ERL_NIF_TERM bin2points(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]){
+    unsigned s = 0, l = 0;
+    const double *data;
 
     if (!(
-                enif_get_list_length(env, centroids, &c_count) &&
-                c_count > 0 &&
-                enif_get_list_cell(env, centroids, &head, &tail) &&
-                enif_get_tuple(env, head, &c_arity, &array)
+                enif_get_uint(env, argv[0], &s) &&
+                s > 0 &&
+                points_bin(env, argv[1], s, &data, &l) &&
+                l > 0
          )) return enif_make_badarg(env);
 
-    // declarations
-    const unsigned size = c_arity, c_states = c_count;
-    avg_state *states = NULL;
-    double *c_data = NULL, *point = NULL;
-#define ERROR { centroids = enif_make_badarg(env); goto error; }
-
-    // allocate avg_states
-    states  = (avg_state *)enif_alloc(c_states * avg_state_size(size));
-    if (!states) ERROR;
-    memset(states, 0, c_states * avg_state_size(size));
-
-    // allocate centroids raw data
-    const unsigned point_size = size * sizeof(double);
-    c_data = (double *)enif_alloc(c_count * point_size);
-    if (!c_data) ERROR;
-
-    // load centroids into raw data
-    for (unsigned i=0; enif_get_list_cell(env, centroids, &head, &centroids); i++)
-        if (!get_point(env, head, size, c_data + i*point_size)) ERROR;
-
-    // allocate working space point
-    point = (double *)enif_alloc(point_size);
-    if (!point) ERROR;
-
-    // loop over points (xs) and set states
-    double sum_d = 0.0;
-    for (; enif_get_list_cell(env, xs, &head, &xs); ) {
-        if (!get_point(env, head, size, point)) ERROR;
-
-        // find minimum
-        unsigned min_i = 0;
-        double min_d = distance(point, c_data, size);
-        for (unsigned i = 1; i<c_states; i++) {
-            const double d = distance(point, c_data + i*point_size, size);
-            if (d<min_d) { min_d = d; min_i = i; };
-        }
-
-        // update state
-        sum_d += min_d;
-        avg_state *state = get_state(states, size, min_i);
-        state->n++;
-        for (unsigned i=0; i<size; i++) state->x[i] += point[i];
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    const unsigned size = s;
+    unsigned count = l;
+    for (; count; count--) {
+        list = enif_make_list_cell(env, make_point(env, data + (count-1)*size, size), list);
     }
 
-    // prepare new centroids
-    centroids = enif_make_list(env, 0);
-    for (unsigned i=0; i<c_states; i++) {
-        avg_state *state = get_state(states, size, i);
-        if (state->n)
-            for (unsigned j=0; j<size; j++)
-                state->x[j] /= state->n;
-        centroids = enif_make_list_cell(env, make_point(env, state->x, size), centroids);
-    }
-
-    // add distance info
-    centroids = enif_make_tuple2(env, centroids, enif_make_double(env, sum_d));
-
-error:
-    if (point) enif_free(point);
-    if (c_data) enif_free(c_data);
-    if (states) enif_free(states);
-    return centroids;
+    return list;
 }
 
 static ErlNifFunc nif_funcs[] = {
-    {"step", 2, step}
+    {"bin2points", 2, bin2points},
+    {"points2bin", 1, points2bin},
+    {"step", 3, step}
 };
 
 #pragma GCC visibility push(default)
